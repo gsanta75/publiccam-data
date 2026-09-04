@@ -14,9 +14,8 @@ endpoint at runtime.
 
     https://gsanta75.github.io/publiccam-data/it-cameras.json
 
-Every OpenStreetMap object tagged `man_made=surveillance` inside the
-Italian administrative boundary: about 14,500 points, ~1 MB of JSON and
-~210 KB over the wire once compressed.
+Every OpenStreetMap object tagged `man_made=surveillance` in Italy: about
+14,600 points, ~1 MB of JSON and ~215 KB over the wire once compressed.
 
 ```json
 {
@@ -43,23 +42,34 @@ produces a byte-identical file and no commit.
 
 ## How it is built
 
-`build-catalog.sh` runs one SPARQL query against the public
-[QLever](https://qlever.cs.uni-freiburg.de/) OSM endpoint and reshapes the
-result. One query per week is a negligible load, and vastly lighter than
-the per-region Overpass calls the app used to make — those rate-limit and
-block per IP, which is what this catalog replaces.
+`build-catalog.sh` downloads the [Geofabrik](https://download.geofabrik.de/europe/italy.html)
+extract of Italy (~2.2 GB), filters it to `man_made=surveillance` with
+[osmium](https://osmcode.org/osmium-tool/) and reshapes the result. It
+needs `osmium-tool` — `apt install osmium-tool`, `brew install osmium-tool`
+— and takes about four minutes end to end, most of it the download.
 
 ```sh
 ./build-catalog.sh              # writes docs/it-cameras.json
 ./build-catalog.sh other.json   # or anywhere else
 ```
 
-The script refuses to write a file with fewer than 8,000 cameras, so a
-partial query result can never be published as a valid snapshot. The app
-applies the same floor to anything it downloads.
+Bulk extracts are the channel OSM publishes for automated consumers, which
+is why the pipeline uses them rather than a query API. The query APIs are
+built for interactive use and defend themselves accordingly: Overpass
+rate-limits and blocks per IP — the very problem this catalog removes from
+the app — and QLever, fast and convenient from a workstation, answers 403
+to datacenter addresses, so it cannot carry an unattended job.
+
+Objects whose geometry osmium cannot build are dropped and counted in the
+run output; that is a handful of relations out of ~14,600. The script also
+refuses to write a file with fewer than 8,000 cameras, so a truncated run
+can never be published as a valid snapshot. The app applies the same floor
+to anything it downloads.
 
 [`update-catalog.yml`](.github/workflows/update-catalog.yml) runs it every
-Monday and commits the result when it changed. GitHub Pages serves `docs/`.
+Monday and commits the result when it changed. GitHub Pages serves `docs/`,
+and its own deployment workflow republishes on that commit — which is how
+an update reaches installed apps.
 
 ## Licence
 
