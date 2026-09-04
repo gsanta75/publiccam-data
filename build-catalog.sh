@@ -15,7 +15,7 @@ set -euo pipefail
 
 ENDPOINT="https://qlever.dev/api/osm-planet"
 OUT="${1:-$(dirname "$0")/docs/it-cameras.json}"
-RAW="$(mktemp -t publiccam-catalog)"
+RAW="$(mktemp "${TMPDIR:-/tmp}/publiccam-catalog.XXXXXX")"
 trap 'rm -f "$RAW"' EXIT
 
 # Fewer cameras than this means the query returned a partial result: keep
