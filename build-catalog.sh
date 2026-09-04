@@ -38,7 +38,7 @@ osmium tags-filter "$WORK/italy.osm.pbf" nwr/man_made=surveillance -o "$WORK/cam
 # the reshaping step below keeps only the objects actually tagged.
 echo "Exporting geometries …"
 osmium export "$WORK/cameras.osm.pbf" \
-  --format geojsonseq --add-unique-id=type_id --omit-rs \
+  --format geojsonseq --add-unique-id=type_id \
   -o "$WORK/cameras.geojsonseq"
 
 OUT="$OUT" MIN_CAMERAS="$MIN_CAMERAS" WORK="$WORK" python3 - <<'PY'
