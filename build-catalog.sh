@@ -1,83 +1,94 @@
 #!/usr/bin/env bash
 #
-# Builds the national surveillance-camera catalog shipped with PublicCam.
+# Builds the national surveillance-camera catalog served to PublicCam.
 #
-# Source: OpenStreetMap (man_made=surveillance) restricted to the Italian
-# administrative boundary (relation 365331), queried through the public
-# QLever SPARQL endpoint — a single query per run, orders of magnitude
-# lighter on OSM infrastructure than per-region Overpass calls.
+# Source: the Geofabrik extract of Italy, filtered to OpenStreetMap objects
+# tagged man_made=surveillance. Geofabrik is the canonical bulk-download
+# mirror for OSM and is meant to be fetched by automated jobs — unlike the
+# public query APIs, which rate-limit, block datacenter IPs, or both.
 #
-# Usage: Scripts/build-camera-catalog.sh [output.json]
+# Requires osmium-tool: `apt install osmium-tool` / `brew install osmium-tool`.
 #
-# The output is the exact file PublicCam reads, both as the snapshot
-# published on GitHub Pages and as the seed bundled in the app.
+# Usage: ./build-catalog.sh [output.json]
 set -euo pipefail
 
-ENDPOINT="https://qlever.dev/api/osm-planet"
+EXTRACT_URL="https://download.geofabrik.de/europe/italy-latest.osm.pbf"
 OUT="${1:-$(dirname "$0")/docs/it-cameras.json}"
-RAW="$(mktemp "${TMPDIR:-/tmp}/publiccam-catalog.XXXXXX")"
-trap 'rm -f "$RAW"' EXIT
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/publiccam-catalog.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
 
-# Fewer cameras than this means the query returned a partial result: keep
-# the previous catalog rather than shipping a truncated one.
+# Fewer cameras than this means something truncated the pipeline: keep the
+# previous catalog rather than publishing a partial one.
 MIN_CAMERAS=8000
 
-read -r -d '' QUERY <<'SPARQL' || true
-PREFIX osmrel: <https://www.openstreetmap.org/relation/>
-PREFIX ogc: <http://www.opengis.net/rdf#>
-PREFIX osmkey: <https://www.openstreetmap.org/wiki/Key:>
-PREFIX geo: <http://www.opengis.net/ont/geosparql#>
-SELECT ?o ?geom ?type ?operator ?zone WHERE {
-  osmrel:365331 ogc:sfContains ?o .
-  ?o osmkey:man_made "surveillance" .
-  ?o geo:hasGeometry/geo:asWKT ?geom .
-  OPTIONAL { ?o osmkey:surveillance:type ?type }
-  OPTIONAL { ?o osmkey:operator ?operator }
-  OPTIONAL { ?o osmkey:surveillance ?zone }
-}
-SPARQL
+if ! command -v osmium >/dev/null 2>&1; then
+  echo "osmium-tool is required (apt install osmium-tool / brew install osmium-tool)" >&2
+  exit 1
+fi
 
-echo "Querying $ENDPOINT …"
-curl -sSf -m 300 -G "$ENDPOINT" \
-  -H "Accept: text/csv" \
+echo "Downloading $EXTRACT_URL …"
+curl -sSfL -m 3600 \
   -A "PublicCam-catalog-build/1.0 (https://github.com/gsanta75/publiccam-data)" \
-  --data-urlencode "query=$QUERY" \
-  -o "$RAW"
+  -o "$WORK/italy.osm.pbf" "$EXTRACT_URL"
 
-OUT="$OUT" MIN_CAMERAS="$MIN_CAMERAS" RAW="$RAW" python3 - <<'PY'
-import csv, json, os, re, sys
+echo "Filtering man_made=surveillance …"
+osmium tags-filter "$WORK/italy.osm.pbf" nwr/man_made=surveillance -o "$WORK/cameras.osm.pbf"
+
+# Referenced nodes come along so way and relation geometries can be built;
+# the reshaping step below keeps only the objects actually tagged.
+echo "Exporting geometries …"
+osmium export "$WORK/cameras.osm.pbf" \
+  --format geojsonseq --add-unique-id=type_id --omit-rs \
+  -o "$WORK/cameras.geojsonseq"
+
+OUT="$OUT" MIN_CAMERAS="$MIN_CAMERAS" WORK="$WORK" python3 - <<'PY'
+import json, os, sys
 from datetime import datetime, timezone
 
-raw, out, minimum = os.environ["RAW"], os.environ["OUT"], int(os.environ["MIN_CAMERAS"])
-point = re.compile(r"-?\d+(?:\.\d+)?")
+work, out, minimum = os.environ["WORK"], os.environ["OUT"], int(os.environ["MIN_CAMERAS"])
 
-def centroid(wkt):
-    """Average of a WKT geometry's vertices — exact for POINT, good enough
-    for the handful of ways/relations tagged as surveillance."""
-    nums = [float(n) for n in point.findall(wkt)]
-    if len(nums) < 2 or len(nums) % 2:
+def centroid(geometry):
+    """Average of a geometry's vertices — exact for Point, good enough for
+    the handful of ways and relations tagged as surveillance."""
+    points = []
+    def walk(node):
+        if (isinstance(node, list) and len(node) == 2
+                and all(isinstance(value, (int, float)) for value in node)):
+            points.append(node)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+    walk(geometry.get("coordinates", []))
+    if not points:
         return None
-    lons, lats = nums[0::2], nums[1::2]
-    return sum(lats) / len(lats), sum(lons) / len(lons)
+    return (sum(p[1] for p in points) / len(points),
+            sum(p[0] for p in points) / len(points))
 
 cameras, skipped = [], 0
-with open(raw, newline="") as handle:
-    for row in csv.DictReader(handle):
-        uri = row.get("o") or ""
-        match = re.search(r"/(node|way|relation)/(\d+)$", uri)
-        position = centroid(row.get("geom") or "")
-        if not match or position is None:
+with open(os.path.join(work, "cameras.geojsonseq")) as handle:
+    for line in handle:
+        line = line.strip().lstrip("\x1e")
+        if not line:
+            continue
+        feature = json.loads(line)
+        tags = feature.get("properties") or {}
+        # tags-filter keeps referenced members; only the tagged objects count.
+        if tags.get("man_made") != "surveillance":
+            continue
+        identifier = str(tags.get("@id") or feature.get("id") or "")
+        position = centroid(feature.get("geometry") or {})
+        if not identifier or position is None:
             skipped += 1
             continue
-        lat, lon = position
-        # Guard against stray geometries outside the country bounding box.
-        if not (35.0 <= lat <= 47.5 and 6.0 <= lon <= 19.0):
+        kind, digits = identifier[0], identifier[1:].lstrip("/")
+        if kind not in "nwr" or not digits.isdigit():
             skipped += 1
             continue
-        kind, osm_id = match.group(1), int(match.group(2))
-        camera = {"i": osm_id, "k": kind[0], "y": round(lat, 6), "x": round(lon, 6)}
-        for key, column in (("t", "type"), ("o", "operator"), ("z", "zone")):
-            value = (row.get(column) or "").strip()
+        latitude, longitude = position
+        camera = {"i": int(digits), "k": kind,
+                  "y": round(latitude, 6), "x": round(longitude, 6)}
+        for key, tag in (("t", "surveillance:type"), ("o", "operator"), ("z", "surveillance")):
+            value = (tags.get(tag) or "").strip()
             if value:
                 camera[key] = value
         cameras.append(camera)
